@@ -4,7 +4,11 @@
 Gera em ``results/``:
 - metrics_comparison.csv  (média ± desvio-padrão de 3 execuções por config)
 - topics_top_words.csv    (top-10 palavras por tópico, para validação qualitativa)
-- figures/elbow_curve.png, figures/umap_scatter.png, figures/metrics_comparison.png
+- figures/elbow_curve.png              (Método do Cotovelo)
+- figures/umap_scatter.png             (clusters propostos vs. categoria arXiv)
+- figures/metrics_comparison.png       (Cv e Taxa de Retenção, todas as configs)
+- figures/topic_size_distribution.png  (nº de documentos por tópico, todas as configs)
+- figures/hdbscan_vs_kmeans_scatter.png (antes/depois: HDBSCAN com outliers vs. K-Means)
 - logs/pipeline.log
 """
 from __future__ import annotations
@@ -52,9 +56,10 @@ def load_or_build_corpus() -> pd.DataFrame:
     return preprocess_corpus(RAW_PATH, PROCESSED_PATH)
 
 
-def run_lda_experiment(tokenized_docs: list[list[str]]) -> dict:
+def run_lda_experiment(tokenized_docs: list[list[str]]) -> tuple[dict, dict, list[int]]:
     logger.info("=== LDA (Gensim) — baseline probabilística ===")
     cv_scores = []
+    reference_words, reference_labels = {}, []
     for seed in SEEDS:
         start = time.time()
         lda, dictionary, corpus, topic_words = run_lda(tokenized_docs, LDA_NUM_TOPICS, seed)
@@ -62,7 +67,15 @@ def run_lda_experiment(tokenized_docs: list[list[str]]) -> dict:
         cv_scores.append(cv)
         logger.info("LDA seed=%d: Cv=%.4f (%.1fs)", seed, cv, time.time() - start)
 
-    return {
+        if seed == SEEDS[0]:
+            reference_words = topic_words
+            # Tópico dominante por documento (maior probabilidade na distribuição inferida).
+            reference_labels = [
+                max(lda.get_document_topics(bow), key=lambda pair: pair[1])[0] if bow else -1
+                for bow in corpus
+            ]
+
+    row = {
         "config": "LDA (Gensim)",
         "embedding": "N/A (bag-of-words)",
         "clustering": "LDA",
@@ -71,7 +84,8 @@ def run_lda_experiment(tokenized_docs: list[list[str]]) -> dict:
         "retention_mean": 1.0,
         "retention_std": 0.0,
         "num_topics": LDA_NUM_TOPICS,
-    }, topic_words
+    }
+    return row, reference_words, reference_labels
 
 
 def run_bertopic_experiments(
@@ -86,8 +100,12 @@ def run_bertopic_experiments(
     ami_between_scores, ami_baseline_cat, ami_proposed_cat = [], [], []
     chosen_ks = []
 
-    last_baseline_words, last_proposed_words = {}, {}
-    last_baseline_labels, last_proposed_labels = [], []
+    # Dados para figuras/inspeção qualitativa vêm sempre da seed de referência
+    # (SEEDS[0]), não da última execução do loop, para consistência entre
+    # tabela de métricas, gráficos e palavras-chave.
+    reference_baseline_words, reference_proposed_words = {}, {}
+    reference_baseline_labels, reference_proposed_labels = [], []
+    reference_num_baseline_topics, reference_num_proposed_topics = 0, 0
     elbow_distortions = None
 
     for seed in SEEDS:
@@ -114,8 +132,11 @@ def run_bertopic_experiments(
         ami_baseline_cat.append(ami_vs_category(baseline_result.labels, categories))
         ami_proposed_cat.append(ami_vs_category(proposed_result.labels, categories))
 
-        last_baseline_words, last_proposed_words = baseline_result.topic_words, proposed_result.topic_words
-        last_baseline_labels, last_proposed_labels = baseline_result.labels, proposed_result.labels
+        if seed == SEEDS[0]:
+            reference_baseline_words, reference_proposed_words = baseline_result.topic_words, proposed_result.topic_words
+            reference_baseline_labels, reference_proposed_labels = baseline_result.labels, proposed_result.labels
+            reference_num_baseline_topics = baseline_result.num_topics
+            reference_num_proposed_topics = proposed_result.num_topics
 
     rows = [
         {
@@ -127,7 +148,7 @@ def run_bertopic_experiments(
             "retention_mean": float(np.mean(baseline_retention)),
             "retention_std": float(np.std(baseline_retention)),
             "ami_vs_category_mean": float(np.mean(ami_baseline_cat)),
-            "num_topics": len(last_baseline_words),
+            "num_topics": reference_num_baseline_topics,
         },
         {
             "config": f"BERTopic + UMAP+K-Means (proposta)",
@@ -140,16 +161,16 @@ def run_bertopic_experiments(
             "ami_vs_category_mean": float(np.mean(ami_proposed_cat)),
             "ami_vs_hdbscan_mean": float(np.mean(ami_between_scores)),
             "chosen_k_mean": float(np.mean(chosen_ks)),
-            "num_topics": len(last_proposed_words),
+            "num_topics": reference_num_proposed_topics,
         },
     ]
 
     extra = {
         "elbow_distortions": elbow_distortions,
-        "baseline_words": last_baseline_words,
-        "proposed_words": last_proposed_words,
-        "baseline_labels": last_baseline_labels,
-        "proposed_labels": last_proposed_labels,
+        "baseline_words": reference_baseline_words,
+        "proposed_words": reference_proposed_words,
+        "baseline_labels": reference_baseline_labels,
+        "proposed_labels": reference_proposed_labels,
     }
     return rows, extra
 
@@ -192,6 +213,74 @@ def plot_umap_scatter(embeddings: np.ndarray, labels: list[int], categories: lis
     plt.close()
 
 
+def plot_topic_size_distribution(configs: dict[str, list[int]], path: Path) -> None:
+    """Bar chart do nº de documentos por tópico (ordenado por tamanho), um painel
+    por configuração, com outliers destacados em cor/textura distintas."""
+    n_configs = len(configs)
+    n_cols = 3
+    n_rows = -(-n_configs // n_cols)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 4.5 * n_rows), squeeze=False)
+    axes = axes.flatten()
+
+    for ax, (name, labels) in zip(axes, configs.items()):
+        labels_arr = np.array(labels)
+        n_docs = len(labels_arr)
+        counts = pd.Series(labels_arr).value_counts()
+        outlier_count = int(counts.get(-1, 0))
+        valid_counts = counts.drop(index=-1, errors="ignore").sort_values(ascending=False)
+        n_topics = len(valid_counts)
+        outlier_pct = 100 * outlier_count / n_docs if n_docs else 0.0
+
+        ax.bar(range(n_topics), valid_counts.values, color="#1F4E79", label="Tópicos válidos")
+        if outlier_count > 0:
+            ax.bar([n_topics], [outlier_count], color="#C00000", hatch="//", label="Outliers (não classificados)")
+
+        ax.set_title(f"{name}\n{n_topics} tópicos · {outlier_pct:.1f}% outliers · {n_docs} docs", fontsize=10)
+        ax.set_xlabel("Tópico (ordenado por tamanho, decrescente)")
+        ax.set_ylabel("Nº de documentos")
+        ax.legend(fontsize=7, loc="upper right")
+
+    for ax in axes[n_configs:]:
+        ax.axis("off")
+
+    fig.suptitle("Distribuição do número de documentos por tópico", fontsize=13)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+
+
+def plot_hdbscan_vs_kmeans_scatter(
+    embeddings: np.ndarray, hdbscan_labels: list[int], kmeans_labels: list[int], seed: int, path: Path
+) -> None:
+    """Compara visualmente, lado a lado e na mesma projeção UMAP 2D, a fragmentação/
+    outliers do HDBSCAN (baseline) contra a partição sem outliers do K-Means (proposta)."""
+    from umap import UMAP
+
+    reducer = UMAP(n_neighbors=15, n_components=2, min_dist=0.0, metric="cosine", random_state=seed)
+    coords = reducer.fit_transform(embeddings)
+
+    hdbscan_arr = np.array(hdbscan_labels)
+    kmeans_arr = np.array(kmeans_labels)
+    is_outlier = hdbscan_arr == -1
+    n_outliers = int(is_outlier.sum())
+    n_docs = len(hdbscan_arr)
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+
+    axes[0].scatter(coords[~is_outlier, 0], coords[~is_outlier, 1], c=hdbscan_arr[~is_outlier], cmap="tab20", s=10, label="Tópicos válidos")
+    axes[0].scatter(coords[is_outlier, 0], coords[is_outlier, 1], c="lightgray", s=10, marker="x", label="Outliers (não classificados)")
+    axes[0].set_title(f"HDBSCAN (baseline)\n{len(set(hdbscan_arr[~is_outlier]))} tópicos · {100 * n_outliers / n_docs:.1f}% outliers")
+    axes[0].legend(fontsize=8, loc="upper right")
+
+    axes[1].scatter(coords[:, 0], coords[:, 1], c=kmeans_arr, cmap="tab20", s=10)
+    axes[1].set_title(f"UMAP + K-Means (proposta)\n{len(set(kmeans_arr))} tópicos · 0,0% outliers")
+
+    fig.suptitle("Mesmo corpus e embedding (SciBERT), mesma projeção UMAP — antes vs. depois", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+
+
 def plot_metrics_comparison(df: pd.DataFrame, path: Path) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
 
@@ -227,7 +316,7 @@ def main() -> None:
     all_rows = []
     all_topic_words = {}
 
-    lda_row, lda_words = run_lda_experiment(tokenized_docs)
+    lda_row, lda_words, lda_labels = run_lda_experiment(tokenized_docs)
     all_rows.append(lda_row)
     all_topic_words["LDA"] = lda_words
 
@@ -263,6 +352,19 @@ def main() -> None:
     plot_elbow_curve(domain_extra["elbow_distortions"], FIGURES_DIR / "elbow_curve.png")
     plot_umap_scatter(domain_embeddings, domain_extra["proposed_labels"], categories, SEEDS[0], FIGURES_DIR / "umap_scatter.png")
     plot_metrics_comparison(metrics_df, FIGURES_DIR / "metrics_comparison.png")
+
+    topic_distribution_configs = {
+        "LDA": lda_labels,
+        "HDBSCAN (MiniLM)": generic_extra["baseline_labels"],
+        "UMAP+K-Means (MiniLM)": generic_extra["proposed_labels"],
+        "HDBSCAN (SciBERT)": domain_extra["baseline_labels"],
+        "UMAP+K-Means (SciBERT)": domain_extra["proposed_labels"],
+    }
+    plot_topic_size_distribution(topic_distribution_configs, FIGURES_DIR / "topic_size_distribution.png")
+    plot_hdbscan_vs_kmeans_scatter(
+        domain_embeddings, domain_extra["baseline_labels"], domain_extra["proposed_labels"], SEEDS[0],
+        FIGURES_DIR / "hdbscan_vs_kmeans_scatter.png",
+    )
     logger.info("Figuras salvas em results/figures/")
 
     logger.info("=== Pipeline finalizado com sucesso ===")

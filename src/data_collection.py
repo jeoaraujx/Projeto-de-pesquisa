@@ -114,15 +114,18 @@ def collect_category(category: str, target_count: int, page_size: int = 100, del
 
 def collect_dataset(
     categories: list[str] = None,
-    per_category: int = 130,
-    target_total: int = 900,
+    per_category: int = 160,
+    target_total: int = 1000,
     delay: float = 3.0,
 ) -> list[Article]:
     """Coleta artigos de várias subáreas de CS e deduplica por arxiv_id.
 
     Coleta um pouco acima do alvo por categoria (buffer) para compensar
     artigos cross-listed que aparecem em mais de uma consulta, depois
-    deduplica e corta para o total alvo mantendo distribuição balanceada.
+    deduplica e corta para exatamente ``target_total`` artigos, distribuindo
+    o corte em round-robin entre as categorias primárias (em vez de uma
+    divisão fixa por bucket) para não sobrar abaixo do alvo quando existem
+    mais primary_category diferentes do que categorias consultadas.
     """
     categories = categories or DEFAULT_CATEGORIES
     all_articles: dict[str, Article] = {}
@@ -138,17 +141,28 @@ def collect_dataset(
     if len(deduped) <= target_total:
         return deduped
 
-    # Corta mantendo distribuição balanceada entre primary_category.
+    # Corta mantendo distribuição balanceada entre primary_category, mas
+    # preenchendo em round-robin até bater exatamente o alvo.
     by_primary: dict[str, list[Article]] = {}
     for article in deduped:
         by_primary.setdefault(article.primary_category, []).append(article)
 
-    per_bucket = max(1, target_total // len(by_primary))
+    bucket_lists = list(by_primary.values())
     trimmed: list[Article] = []
-    for bucket in by_primary.values():
-        trimmed.extend(bucket[:per_bucket])
+    idx = 0
+    while len(trimmed) < target_total:
+        progressed = False
+        for bucket in bucket_lists:
+            if idx < len(bucket):
+                trimmed.append(bucket[idx])
+                progressed = True
+                if len(trimmed) == target_total:
+                    break
+        if not progressed:
+            break
+        idx += 1
 
-    return trimmed[:target_total]
+    return trimmed
 
 
 def save_jsonl(articles: list[Article], path: Path) -> None:

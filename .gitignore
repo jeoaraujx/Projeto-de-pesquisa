@@ -6,3 +6,5 @@ venv/
 env/
 .env
 results/logs/*.log
+.vscode/
+*.code-workspace
